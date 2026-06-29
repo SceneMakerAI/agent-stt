@@ -1,108 +1,118 @@
 # stt-agent
 
-STT 자막 **교정 파이프라인 오케스트레이터** (FastAPI).
+Subtitle **correction pipeline orchestrator** (FastAPI) — the post-STT stage of the video pipeline.
+For one video (`v_id`), it chains audio extraction → STT → subtitle correction → DB write → next-stage trigger into a single request, replies immediately, and runs the work in the background.
 
-영상 1개(`v_id`)에 대해 음성 추출 → STT → 자막 교정 → DB 저장 → 다음 단계(agent-vision) 트리거까지를 한 요청으로 조립한다. 요청은 **즉시 접수 응답**하고, 실제 공정은 백그라운드에서 처리한다.
+[한국어 README](README.ko.md)
 
-## 공정 흐름
+## Overview
+
+Given a `v_id` and a source `file_path`, `stt-agent` orchestrates the full correction
+flow across external services and writes the final subtitles to the database. The HTTP
+request is **accepted instantly**; the actual work runs in a background task.
+
+The service exposes a single endpoint:
+
+- **`POST /api/v1/stt_svc`** `{v_id, file_path}` — marks the video "processing", returns `accepted`, and dispatches the background pipeline.
+
+## Pipeline
 
 ```
 POST /api/v1/stt_svc {v_id, file_path}
         │
-        ├─ 1-1. DB 상태 '처리중'(1005) 갱신  → 결과 확인(없는 v_id면 즉시 응답)
+        ├─ 1-1. DB status → 'processing' (1005)   → validate v_id (unknown → reply immediately)
         │
-        └─ 즉시 "accepted" 응답  ───────────────┐
-                                                 │ (백그라운드 process)
-   ② prep    POST prep_stt /pre_svc/  → audio_path   (ffmpeg 추출/분할)
-   ③ stt     POST prep_stt /stt_svc/  → segments     (whisper STT, 5~10분)
-   ④ correct vLLM(Qwen) 페이지 병렬 교정 → corrected
-   ⑤ save    DB t_dialogue INSERT + 상태 '완료'(1006)
-   ⑦ vision  POST agent-vision /api/v1/analyze       (다음 단계 트리거)
+        └─ reply "accepted" immediately  ───────────┐
+                                                     │ (background process)
+   [2] prep    POST prep_stt /pre_svc/  → audio_path   (ffmpeg extract / chunk)
+   [3] stt     POST prep_stt /stt_svc/  → segments     (whisper STT, 5–10 min)
+   [4] correct vLLM (Qwen) per-page parallel correction → corrected
+   [5] save    DB t_dialogue INSERT + status → 'done' (1006)
+   [7] vision  POST agent-vision /api/v1/analyze        (trigger next stage)
 ```
 
-- **prep/stt** 는 같은 서버(prep_stt). STT 는 whisper(GPU) 라 한 번에 1 job → 세마포어로 제한.
-- **교정(④)** 만 async(페이지 병렬), 나머지 블로킹 호출은 `asyncio.to_thread` 로 이벤트루프를 막지 않는다.
+- **prep/stt** live on the same server (prep_stt). STT is whisper (GPU), one job at a time → bounded by a semaphore.
+- Only **correction (4)** is async (per-page parallel); the other blocking calls go through `asyncio.to_thread` so they never block the event loop.
 
-## 설계 요점
+## Design notes
 
-- **단일 엔드포인트** `POST /api/v1/stt_svc` — 받자마자 응답, 공정은 `BackgroundTasks` 로 처리.
-- **공유 리소스** (vLLM 클라이언트 / httpx / 세마포어 / 카운터)는 `lifespan` 에서 1회 생성해 `app.state` 로 공유. vLLM 의 `AsyncOpenAI` 는 uvicorn 이벤트루프에 바인딩된다.
-- **동시성 제어** (세마포어):
-  - `STT_CONCURRENCY` — prep+stt 동시 처리 상한 (GPU 보호)
-  - `VLLM_CONCURRENCY` — 교정 페이지 동시 호출 상한 (vLLM `chat()` 내부 세마포어)
-- **백프레셔** — 접수 대기열이 `MAX_REQ_CNT` 를 넘으면 **429** 로 거절(무한 대기열 방지).
-- **단계 추적** — 백그라운드 실패 시 `stage`(prep/stt/correct/save/vision) 를 로그에 남긴다.
+- **Single endpoint** `POST /api/v1/stt_svc` — replies on arrival, processes via `BackgroundTasks`.
+- **Shared resources** (vLLM client / httpx / semaphore / counter) are created once in `lifespan` and shared via `app.state`. The vLLM `AsyncOpenAI` client binds to the uvicorn event loop.
+- **Concurrency control** (semaphores):
+  - `STT_CONCURRENCY` — max concurrent prep+stt jobs (protects the GPU)
+  - `VLLM_CONCURRENCY` — max concurrent correction calls (semaphore inside vLLM `chat()`)
+- **Backpressure** — when the pending queue exceeds `MAX_REQ_CNT`, new requests are rejected with **429** (avoids an unbounded queue).
+- **Stage tracking** — background failures log the `stage` (prep/stt/correct/save/vision).
 
-## 프로젝트 구조
+## Project layout
 
 ```
-main.py                 FastAPI app + lifespan(공유 리소스) + 라우터 등록
-config.py               .env 로딩 + 설정값
-test.sh                 로컬 curl 테스트
+main.py                 FastAPI app + lifespan (shared resources) + router registration
+config.py               .env loading + settings
+test.sh                 local curl test
 lib/
   http/
-    stt_svc.py          라우터 + 요청 DTO + 백그라운드 process(공정 조립)
-    http_util.py        요청/응답 로깅 미들웨어
-  client/               외부 서비스 호출 (1 서비스 = 1 모듈)
-    db.py               MariaDB (상태 갱신 + 자막 INSERT)
-    prep_stt.py         prep_stt 서버 (pre_svc/ffmpeg, stt)
-    vllm.py             vLLM(Qwen) 교정 클라이언트
-    vision.py           agent-vision 트리거
-  correct/              자막 교정 로직
-    corrector.py        segments → corrected (페이지 병렬)
-    chunk.py            segments → 페이지 분할
-    prompt.py           교정 프롬프트
-  debug.py              단계별 중간 결과 덤프 (검수용, write-only)
-  log.py                공용 로거 (파일 + 콘솔)
+    stt_svc.py          router + request DTO + background process (pipeline assembly)
+    http_util.py        request/response logging middleware
+  client/               external service calls (1 service = 1 module)
+    db.py               MariaDB (status update + subtitle INSERT)
+    prep_stt.py         prep_stt server (pre_svc/ffmpeg, stt)
+    vllm.py             vLLM (Qwen) correction client
+    vision.py           agent-vision trigger
+  correct/              subtitle correction logic
+    corrector.py        segments → corrected (per-page parallel)
+    chunk.py            segments → page split
+    prompt.py           correction prompt
+  debug.py              per-step dump (inspection, write-only)
+  log.py                shared logger (file + console)
 ```
 
-## 설정 (.env)
+## Configuration (.env)
 
-`.env.example` 를 복사해 `.env` 로 만들고 값을 채운다.
+Copy `.env.example` to `.env` and fill in the values.
 
-| 키 | 설명 |
+| Key | Description |
 |---|---|
-| `HOST` / `PORT` | 이 서버(FastAPI) 바인드 주소/포트 |
-| `STT_HOST` / `STT_PORT` | prep_stt 서버 (pre_svc + stt) |
-| `VLLM_HOST` / `VLLM_PORT` | vLLM(Qwen) 교정 서버 |
+| `HOST` / `PORT` | this server's (FastAPI) bind address/port |
+| `STT_HOST` / `STT_PORT` | prep_stt server (pre_svc + stt) |
+| `VLLM_HOST` / `VLLM_PORT` | vLLM (Qwen) correction server |
 | `RDB_HOST` / `RDB_PORT` / `RDB_USER` / `RDB_PW` / `RDB_NAME` | MariaDB |
-| `VISION_HOST` / `VISION_PORT` | agent-vision 서버 |
-| `DEBUG_DIR` | 중간 결과 덤프 경로 |
+| `VISION_HOST` / `VISION_PORT` | agent-vision server |
+| `DEBUG_DIR` | dump path for intermediate results |
 
-
-## 실행
+## Run
 
 ```bash
-uv sync                                              # 의존성 설치
-uv run uvicorn main:app --host 0.0.0.0 --port 8000   # 서버 실행 (--reload 로 개발)
+uv sync                                              # install dependencies
+uv run uvicorn main:app --host 0.0.0.0 --port 8000   # run (--reload for dev)
 ```
 
-## 테스트
+## Test
 
 ```bash
-./test.sh                          # 기본 v_id=1
-./test.sh 3 output/3/audio.wav     # v_id, file_path 지정
+./test.sh                          # defaults to v_id=1
+./test.sh 3 output/3/audio.wav     # specify v_id, file_path
 BASE=http://localhost:8000 ./test.sh
 
-# 한 줄 (복붙용)
+# one-liner
 curl -sS -X POST http://localhost:8000/api/v1/stt_svc \
   -H 'Content-Type: application/json' \
   -d '{"v_id":1,"file_path":"output/1/audio.wav"}'
 ```
 
-응답:
+Responses:
 ```json
-{"v_id": 1, "status": "accepted"}        // 접수됨 (공정은 백그라운드)
-{"v_id": 1, "status": "Not found v_id"}  // t_video 에 없는 v_id
-// 429 — 대기열 가득참 (Retry-After 헤더)
+{"v_id": 1, "status": "accepted"}        // accepted (processed in background)
+{"v_id": 1, "status": "Not found v_id"}  // v_id not in t_video
+// 429 — queue full (Retry-After header)
 ```
 
-## 요구사항
+## Requirements
 
 - Python >= 3.13
 - [uv](https://docs.astral.sh/uv/)
-- 외부 서비스: prep_stt, vLLM(Qwen), MariaDB, agent-vision
+- External services: prep_stt, vLLM (Qwen), MariaDB, agent-vision
 
-## 라이선스
+## License
 
 [MIT](LICENSE)

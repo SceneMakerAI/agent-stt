@@ -1,0 +1,28 @@
+# ── 환경변수 (DB 비밀번호 등 비밀값 포함 — 절대 커밋 금지)
+.env
+
+# ── Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.Python
+build/
+dist/
+
+# ── 가상환경 / uv
+.venv/
+
+# ── 산출물 / 중간 덤프 (검수용, 커밋 불필요)
+output/
+
+# ── 에디터 / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# ── 테스트 / 캐시
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
