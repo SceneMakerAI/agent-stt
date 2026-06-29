@@ -78,7 +78,7 @@ async def process(state, v_id: int, file_path: str) -> None:
 
         # ⑦ 다음 단계 트리거 — agent-vision 분석 요청
         stage = "vision"
-        await asyncio.to_thread(vision.agent_vision, state.http, v_id, False)
+        await asyncio.to_thread(vision.agent_vision, state.http, v_id, True)
         
     except Exception:  # noqa: BLE001 — 백그라운드라 응답으로 못 알림, 로그로 남김
         log.exception(f"[bg] v_id={v_id} 실패 (stage={stage})")
