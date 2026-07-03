@@ -17,10 +17,11 @@ from lib.log import get_logger
 log = get_logger(__name__)
 
 
-def prep(http: httpx.Client, vid: int, file: str) -> str:
-    """② prep_svc — POST /pre_svc/ {vid, file} 동기 호출 → audio_path 반환.
+def prep(http: httpx.Client, vid: int, file: str) -> dict:
+    """② prep_svc — POST /pre_svc/ {vid, file} 동기 호출 → 응답 dict 반환.
 
-    영상 원본(file)을 받아 ffmpeg 로 음성 추출 + 분할. 결과의 audio_path 가 STT 입력.
+    영상 원본(file)을 받아 ffmpeg 로 음성 추출 + 분할. 응답의 audio_path 가 STT 입력,
+    video_chunk_cnt / video_chunk_last 는 vision 트리거(⑦)에 전달.
     """
     r = http.post(
         f"{config.PREP_STT_BASE_URL}/pre_svc/",
@@ -29,9 +30,11 @@ def prep(http: httpx.Client, vid: int, file: str) -> str:
     )
     r.raise_for_status()
     data = r.json()
-    audio_path = data["audio_path"]
-    log.info(f"prep ffmpeg done: job_id={data.get('job_id')} audio_path={audio_path}")
-    return audio_path
+    if str(data.get("status", "")).upper() != "OK":   # 서버가 'OK'/'ok' 혼용. 실패 시 에러 원인 메시지
+        raise RuntimeError(f"prep failed: {data.get('status')}")
+    log.info(f"prep ffmpeg done: job_id={data.get('job_id')} audio_path={data['audio_path']} "
+             f"chunks={data.get('video_chunk_cnt')} last={data.get('video_chunk_last')}")
+    return data
 
 
 def stt(http: httpx.Client, vid: int, file_path: str) -> list[dict]:

@@ -13,13 +13,26 @@ from lib.log import get_logger
 log = get_logger(__name__)
 
 
-def agent_vision(http: httpx.Client, v_id: int, force: bool = False) -> dict:
-    """agent-vision 에 분석 요청. POST /api/v1/analyze {v_id, force} → 응답 JSON 반환."""
+def agent_vision(http: httpx.Client, v_id: int, force: bool = False,
+                 prep_res: dict | None = None) -> dict:
+    """agent-vision 에 분석 요청. POST /api/v1/analyze → 응답 JSON 반환.
+
+    prep_res 는 prep_svc 응답 dict — 영상청크 정보(video_chunk_cnt/last)를 꺼내 동봉한다.
+    """
+    prep_res = prep_res or {}
+    video_chunk_cnt = prep_res.get("video_chunk_cnt", 0)
+    video_chunk_last = prep_res.get("video_chunk_last", "")
     r = http.post(
         f"{config.VISION_BASE_URL}/api/v1/analyze",
-        json={"v_id": v_id, "force": force},
+        json={
+            "v_id": v_id,
+            "force": force,
+            "video_chunk_cnt": video_chunk_cnt,
+            "video_chunk_last": video_chunk_last,
+        },
     )
     r.raise_for_status()
     data = r.json()
-    log.info(f"vision analyze 트리거: v_id={v_id} force={force} → {data}")
+    log.info(f"vision analyze 트리거: v_id={v_id} force={force} "
+             f"chunks={video_chunk_cnt} last={video_chunk_last} → {data}")
     return data

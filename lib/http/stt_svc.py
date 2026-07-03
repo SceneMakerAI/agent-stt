@@ -1,7 +1,8 @@
 """stt_svc 핸들러 (HTTP 라우터) + 요청 DTO. 받는 URL 1개.
 
-요청 받고 → DB 상태 '처리중'(1005) 갱신 → 결과 확인 후 바로 응답.
+요청 받고 → DB 상태 'FFMPEG 시작'(1001) 갱신 → 결과 확인 후 바로 응답.
 나머지 공정(prep_svc → stt → 교정 → DB 저장)은 응답 후 내부(백그라운드)에서 처리.
+상태 흐름: 1001(FFMPEG) → 1005(STT) → 1006(완료) / 실패 시 -1.
 """
 import asyncio
 
@@ -17,6 +18,8 @@ from lib.log import get_logger
 
 router = APIRouter(prefix="/api/v1", tags=["stt_svc"])
 log = get_logger(__name__)
+
+FFMPEG_START, STT_START, STT_END, STT_ERROR = 1001, 1005, 1006, -1   # t_video.status_code
 
 
 class SttRequest(BaseModel):
@@ -39,8 +42,8 @@ async def stt_svc(req: SttRequest, bg: BackgroundTasks, request: Request):
             headers={"Retry-After": "60"},
         )
 
-    # 1-1. 상태 '처리중'(1005) 갱신 — 빠른 UPDATE 라 직접 호출. 결과(행 수)로 검증.
-    rows = db.set_status(req.v_id, 1005)
+    # 1-1. 상태 'FFMPEG 시작'(1001) 갱신 — 빠른 UPDATE 라 직접 호출. 결과(행 수)로 검증.
+    rows = db.set_status(req.v_id, FFMPEG_START)
     if rows != 1:                                  # 1행이어야 정상. 0 → t_video 에 없는 v_id
         return {"v_id": req.v_id, "status": "Not found v_id"}   # 200 + 본문으로 결과 전달
 
@@ -62,10 +65,11 @@ async def process(state, v_id: int, file_path: str) -> None:
         # prep+stt 는 같은 서버(GPU 1개) — 서비스 개수를 제한
         async with state.stt_sem:
             # FFMPEG
-            audio_path = await asyncio.to_thread(prep_stt.prep, state.http, v_id, file_path)
+            prep_res = await asyncio.to_thread(prep_stt.prep, state.http, v_id, file_path)
 
             stage = "stt"
-            segments = await asyncio.to_thread(prep_stt.stt, state.http, v_id, audio_path)
+            await asyncio.to_thread(db.set_status, v_id, STT_START)
+            segments = await asyncio.to_thread(prep_stt.stt, state.http, v_id, prep_res["audio_path"])
 
         debug.dump(v_id, "stt", segments)
 
@@ -73,14 +77,18 @@ async def process(state, v_id: int, file_path: str) -> None:
         corrected = await corrector.correct(state.vllm, segments)
 
         stage = "save"
-        await asyncio.to_thread(db.save_result, v_id, corrected, 1006)
+        await asyncio.to_thread(db.save_result, v_id, corrected, STT_END)
         log.info(f"[bg] v_id={v_id} 완료: {len(corrected)} dialogues")
 
-        # ⑦ 다음 단계 트리거 — agent-vision 분석 요청
+        # ⑦ 다음 단계 트리거 — agent-vision 분석 요청 (prep 응답을 그대로 넘김)
         stage = "vision"
-        await asyncio.to_thread(vision.agent_vision, state.http, v_id, True)
+        await asyncio.to_thread(vision.agent_vision, state.http, v_id, True, prep_res)
         
-    except Exception:  # noqa: BLE001 — 백그라운드라 응답으로 못 알림, 로그로 남김
+    except Exception:  # noqa: BLE001 — 백그라운드라 응답으로 못 알림, 로그 + DB 상태로 보고
         log.exception(f"[bg] v_id={v_id} 실패 (stage={stage})")
+        try:
+            await asyncio.to_thread(db.set_status, v_id, STT_ERROR)
+        except Exception:  # noqa: BLE001 — DB 장애 자체가 원인일 수 있음, 로그만 남김
+            log.exception(f"[bg] v_id={v_id} 실패 상태(-1) 기록도 실패")
     finally:
         state.current_req_cnt -= 1                         # 성공/실패 무관 접수 슬롯 반납
