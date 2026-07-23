@@ -42,9 +42,16 @@ VISION_BASE_URL = f"http://{VISION_HOST}:{VISION_PORT}"
 MAX_REQ_CNT = 5              # 접수 대기열 상한 (running + 대기). 초과 시 429 거절
 STT_CONCURRENCY = 2          # prep+stt 동시 처리 상한 (whisper GPU 1개라 1)
 
-# ── 교정 페이지 분할 (④)
-VLLM_CONCURRENCY = 8          # 페이지 동시 호출 상한
-PAGE_MAX_SEGMENTS = 30        # 페이지당 최대 자막 줄 수
+# ── vLLM 동시성 — 클라이언트 전역 세마포어 (교정·검색 등 모든 vllm 호출이 공유)
+VLLM_CONCURRENCY = 8          # 동시 vLLM 호출 상한 (lib/client/vllm.py 가 사용)
+
+# ── 요약 (⑤ summary) — 구간(청크 병렬, 직전 N개 문맥) + 전체(마지막 1콜)
+SUMMARY_WINDOW_SEC = 60      # 구간 요약 윈도우(초). 300=5분, 60=1분
+SUMMARY_PREV_N = 3           # 구간 요약 시 참고할 직전 구간요약 개수 (앞 흐름 문맥. 뒤는 안 봄)
+SUMMARY_CHUNKS = 8           # 구간요약을 몇 덩이로 나눠 동시에 돌릴지. 덩이 안은 순차(문맥 유지),
+                             # 덩이끼리는 병렬. VLLM_CONCURRENCY 와 맞추는 게 최적(더 키워도 대기)
+
+# ── 2차 보정 (cast — 화자 매칭 + 대사 이름 정정) 은 별도 공정으로 분리 (CAST.md 참고).
 
 
 # ── 디버그 — 단계별 중간 결과를 파일로 덤프 (검수용).
@@ -52,7 +59,10 @@ PAGE_MAX_SEGMENTS = 30        # 페이지당 최대 자막 줄 수
 #    다음 단계가 절대 읽지 않는다 (파일 read 는 느려서 금지). 순수 디버깅용.
 DEBUG_DIR = Path(os.getenv("DEBUG_DIR"))
 DUMP_STEPS = {
-    "stt":       True,   # ③ model_svc STT → segments
-    "pages":     True,   # ④ 페이지 분할 (vLLM 입력)
-    "corrected": True,   # ④ vLLM 교정 결과
+    "1_stt":     True,   # 1차 STT(Qwen) → segments
+    "2_roster":  True,   # web_search 명단 텍스트 (스포츠·드라마) — whisper 프롬프트 재료
+    "3_whisper": True,   # 2차 전사(whisper) {idx: text} — 교정 대조용 (스포츠·드라마)
+    "4_correct": True,   # vLLM 교정 결과 (1차 + whisper + 명단 대조)
+    "5_hallu":   True,   # 할루시 필터 (kept/dropped/verdicts)
+    "6_summary": True,   # 요약 (구간 + 전체)
 }

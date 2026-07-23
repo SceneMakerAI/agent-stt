@@ -15,11 +15,19 @@ log = get_logger(__name__)
 
 
 def dump(v_id: int, step: str, data) -> None:
-    """step 결과를 output/{v_id}/{step}.json 으로 덤프. 플래그 꺼져 있으면 통과."""
+    """step 결과를 output/{v_id}/ 에 덤프. 플래그 꺼져 있으면 통과.
+
+    문자열 data → {step}.txt 원문 그대로 (긴 증거 텍스트 — json 으로 감싸면 개행이
+    escape 돼 한 줄로 읽기 불가). dict/list → {step}.json (indent).
+    """
     if not config.DUMP_STEPS.get(step):
         return
     d = config.DEBUG_DIR / str(v_id)
     d.mkdir(parents=True, exist_ok=True)
-    path = d / f"{step}.json"
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    if isinstance(data, str):
+        path = d / f"{step}.txt"
+        path.write_text(data, encoding="utf-8")
+    else:
+        path = d / f"{step}.json"
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     log.info(f"[dump] {step} → {path}")

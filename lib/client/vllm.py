@@ -27,11 +27,9 @@ class VLLMClient:
         self._sem = sem
         self.model = model
 
-    async def chat(
-        self,
-        *,
+    async def chat(self, *,
         messages: list[dict],
-        temperature: float = 0.2,
+        temperature: float = 0.1,
         max_tokens: int = 2048,
         response_format: dict | None = None,
         extra_body: dict | None = None,

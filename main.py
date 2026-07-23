@@ -47,10 +47,9 @@ async def lifespan(app: FastAPI):
     # 현재 접속한 사용자 수
     app.state.current_req_cnt = 0
 
-    # prep+stt 동시성 상한 — 전역 1개(GPU). 
+    # prep+stt 동시성 상한 — 전역 1개(GPU).
     app.state.stt_sem = asyncio.Semaphore(config.STT_CONCURRENCY)
-    
-        
+
     log.info(f"stt_agent up: {config.HOST}:{config.PORT}")
     yield
     app.state.http.close()

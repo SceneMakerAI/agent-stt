@@ -1,15 +1,26 @@
-"""HTTP 미들웨어 — 요청/응답 로깅.
+"""HTTP 공용 — 요청/응답 로깅 미들웨어 + 핸들러 공통 응답.
 
-요청 들어올 때 method+URL, 끝날 때 상태코드+URL+소요시간을 로그에 남긴다.
+미들웨어: 요청 들어올 때 method+URL, 끝날 때 상태코드+URL+소요시간 로그.
 main.py 에서 register(app) 로 등록.
 """
 import time
 
 from fastapi import Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 from lib.log import get_logger
 
 log = get_logger(__name__)
+
+
+def busy_response(body: BaseModel) -> JSONResponse:
+    """백프레셔 초과 시 공통 429 응답. 본문은 각 URL 의 response 모델 (여기선 감싸기만)."""
+    return JSONResponse(
+        status_code=429,
+        content=body.model_dump(),
+        headers={"Retry-After": "60"},
+    )
 
 
 def register(app):
