@@ -20,14 +20,33 @@ from collections import Counter
 from lib.client.vllm import VLLMClient
 from lib.log import get_logger
 from lib.svc.stt.hallucination import prompt
+from lib.util import time_to_sec
 
 log = get_logger(__name__)
+
+# 발화 속도 상한(글자/초). 넘으면 '사람이 말한 게 아님' = 배경음악·반복 환각 → 무조건 drop.
+#   사람 최대 ~10자/초(빠른 아나운서), 정상 대사 실측 최대 35자/초(0.2초로 짧게 끊긴 경우).
+#   그 3배인 100 은 물리적으로 불가능한 값이라 오탐 없이 환각만 잡는다. v4 실측:
+#     "Pass the mic…"(음악) 4143 / "가볍다 가벼워…"(반복) 1050 / "경상도 경상도"(반복) 460 → drop
+#   언어 무관(한국어 반복 환각도 대상)이라 LLM 언어판정과 별개로 여기서 먼저 친다.
+MAX_CHARS_PER_SEC = 100
 
 
 def main_lang(segments: list[dict]) -> str:
     """최빈 lang 을 주언어로 (한국 방송이면 대개 'Korean')."""
     c = Counter(s.get("lang", "") for s in segments if s.get("lang"))
     return c.most_common(1)[0][0] if c else ""
+
+
+def _too_fast(seg: dict) -> bool:
+    """발화 속도가 사람 한계(MAX_CHARS_PER_SEC)를 넘으면 True = 환각(배경음악·반복).
+
+    dur<=0(타임스탬프 이상)이면 판정 불가라 False(=LLM 판정에 맡김). 공백은 글자수에서 뺀다.
+    """
+    dur = time_to_sec(seg["end"]) - time_to_sec(seg["start"])
+    if dur <= 0:
+        return False
+    return len("".join(seg["text"].split())) / dur > MAX_CHARS_PER_SEC
 
 
 def _reindex(segments: list[dict]) -> list[dict]:
@@ -57,8 +76,13 @@ async def run(vllm: VLLMClient, segments: list[dict]) -> dict:
     id2seg = {s["idx"]: s for s in segments}
     verdicts = await prompt.judge(vllm, main, candidates, id2seg)
 
-    dropped, survived = [], []
+    dropped, survived, too_fast = [], [], 0
     for s in segments:
+        # 발화속도 초과는 언어·LLM판정 무관하게 먼저 drop (배경음악·반복 환각)
+        if _too_fast(s):
+            dropped.append(s)
+            too_fast += 1
+            continue
         v = verdicts.get(s["idx"], "keep")
         if v == "drop":
             dropped.append(s)
@@ -69,5 +93,5 @@ async def run(vllm: VLLMClient, segments: list[dict]) -> dict:
     kept = _reindex(survived)
 
     log.info(f"hallu filter: main={main!r} 후보={len(candidates)} "
-             f"drop={len(dropped)} kept={len(kept)}/{len(segments)}")
+             f"drop={len(dropped)}(속도초과 {too_fast}) kept={len(kept)}/{len(segments)}")
     return {"main_lang": main, "verdicts": verdicts, "dropped": dropped, "kept": kept}

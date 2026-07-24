@@ -5,11 +5,12 @@
 1차(Qwen)가 뽑은 구간 중 '보낼 만한 것'만 골라 워커에 던지면, 워커가 그 구간만
 seek-read 해서 whisper 로 다시 받아쓴다. 화자·시각은 1차 것을 쓰므로 텍스트만 받는다.
 
-pick_windows() 로 대상을 고르는 이유 (6영상 실측):
+어떤 카테고리를 보낼지(스포츠·드라마)는 호출측(process._needs_enrichment)이 판정한다.
+  - 뉴스 96% / 다큐 84% 는 이미 1차와 일치 → 이득 없이 환각 위험만이라 아예 안 부른다.
+  - 스포츠 56% / 드라마 65~73% 는 whisper 가 실제로 고침(좌측에·1아웃 1루와 3루).
+이 모듈은 넘어온 구간 중 '보낼 만한 것'만 _pick 으로 거른다 (6영상 실측):
   - 짧은 필러(0.3초 "자") → whisper 가 없는 말을 지어냄 ("MBC 뉴스 김성현입니다")
   - 영어/중국어/일본어 구간 → ko 강제라 유창한 환각 ("다음 영상에서 만나요")
-  - 뉴스 96% / 다큐 84% 는 이미 1차와 일치 → 이득 없이 환각 위험만. 스킵.
-  - 스포츠 56% / 드라마 65~73% 는 whisper 가 실제로 고침(좌측에·1아웃 1루와 3루). 적용.
 
 워커가 게이트(flag)로 환각을 이미 걸러 보내므로, flag 붙은 창은 여기서 버린다.
 
@@ -30,7 +31,6 @@ log = get_logger(__name__)
 
 STT2_URL = f"{config.PREP_STT_BASE_URL}/stt2_svc/"
 
-CATEGORIES = ("스포츠", "드라마")   # 게이팅 — 이 카테고리만 2차 전사
 MIN_SEC = 3.0       # 이보다 짧으면 문맥 부족 → whisper 환각
                     #   ⚠ 2.0 으로 낮춰봤으나 손해(v1 GT 40→38~40). 대상 +21창이 되면서
                     #   짧은 창의 whisper 가 얻는 것보다 흔드는 게 많았다. 3.0 유지할 것.
@@ -55,19 +55,19 @@ class Stt2Request(BaseModel):
     prompt: str = ""        # whisper initial_prompt (등장인물 편향). 빈 문자열이면 미적용
 
 
-def stt2(http: httpx.Client, vid: int, segments: list[dict], category: str,
+def stt2(http: httpx.Client, vid: int, segments: list[dict],
          roster: str = "") -> dict[int, str]:
-    """2차 전사 — 대상 구간만 골라 POST STT2_URL → {idx: whisper 텍스트}.
+    """2차 전사 — 보낼 만한 구간만 골라 POST STT2_URL → {idx: whisper 텍스트}.
 
     segments : 1차 STT 산출물 [{idx, start:"HH:MM:SS.s", end, text, lang}, ...]
-    category : 게이팅 키 (스포츠·드라마만 수행, 그 외는 {} 반환)
     roster   : 명단 텍스트(web_search) — 여기서 whisper 프롬프트를 만든다. 없으면 프롬프트 없이.
 
-    대상 선정은 내부(_pick)에서 한다 — 필터 없이 이 호출을 할 일이 없으므로 묶었다.
+    ⚠ 카테고리 게이팅(스포츠·드라마만)은 호출측(process._needs_enrichment)이 판정한다 —
+      이 함수는 "받은 구간을 whisper 로 보내는" transport 다. 여기선 구간 품질만 거른다(_pick).
     flag(lowconf/repeat/fallback/echo/empty) 나 error 가 붙은 창은 신뢰 불가라 결과에서 뺀다.
     → 호출측은 "그 idx 는 whisper 가 없다"로 취급하면 된다 (교정이 1차 텍스트를 유지).
     """
-    windows = _pick(segments, category)
+    windows = _pick(segments)
     if not windows:
         return {}
     body = Stt2Request(v_id=str(vid), windows=[Window(**w) for w in windows],
@@ -120,13 +120,12 @@ def _prompt(roster: str, segments: list[dict]) -> str:
 
 
 # ── 대상 선정 (뭘 보낼지) ─────────────────────────────────────────────
-def _pick(segments: list[dict], category: str) -> list[dict]:
-    """2차 전사를 돌릴 구간만 고른다. 대상 아니면 [].
+def _pick(segments: list[dict]) -> list[dict]:
+    """2차 전사를 돌릴 구간만 고른다 (구간 품질 필터).
 
-    거르는 이유는 모듈 docstring 참고 — 짧은 필러·비한국어·이득 없는 카테고리를 뺀다.
+    짧은 필러(문맥 부족)·내용 없는 창(음악/함성)·비한국어(ko 강제라 환각)를 뺀다.
+    카테고리 게이팅은 호출측이 이미 판정했으므로 여기선 안 본다.
     """
-    if not (category and category.startswith(CATEGORIES)):
-        return []
     out = []
     for s in segments:
         if s.get("lang") != "Korean":
@@ -135,7 +134,7 @@ def _pick(segments: list[dict], category: str) -> list[dict]:
         if b - a < MIN_SEC or _chars(s["text"]) < MIN_CHARS or _ko_ratio(s["text"]) < MIN_KO:
             continue
         out.append({"idx": s["idx"], "start": round(a, 2), "end": round(b, 2), "language": "ko"})
-    log.info(f"stt2 대상: {len(segments)}세그 → {len(out)}창 (category={category!r})")
+    log.info(f"stt2 대상: {len(segments)}세그 → {len(out)}창")
     return out
 
 

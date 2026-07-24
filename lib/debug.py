@@ -4,7 +4,7 @@
    다음 단계가 절대 읽지 않는다 (파일 read = 느림 → 금지). 순수 디버깅용.
 
 process() 가 각 단계 끝에서 dump(v_id, step, data) 한 줄로 호출.
-config.DUMP_STEPS[step] 가 켜졌을 때만 실제로 쓴다.
+config.DUMP_STEPS[step] 가 켜졌을 때만 실제로 쓴다 (.env DUMP_STEPS_* = true/false).
 """
 import json
 
@@ -22,7 +22,7 @@ def dump(v_id: int, step: str, data) -> None:
     """
     if not config.DUMP_STEPS.get(step):
         return
-    d = config.DEBUG_DIR / str(v_id)
+    d = config.DUMP_DIR / str(v_id)
     d.mkdir(parents=True, exist_ok=True)
     if isinstance(data, str):
         path = d / f"{step}.txt"

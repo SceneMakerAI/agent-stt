@@ -9,6 +9,7 @@ stt_svc(http 핸들러)는 run() 하나만 백그라운드로 띄운다. 접수 
 """
 import asyncio
 
+import config
 from lib import debug
 from lib.client import vision
 from lib.client.prep_stt import ffmpeg, stt, stt2
@@ -25,9 +26,16 @@ log = get_logger(__name__)
 STT_START, STT_END, STT_ERROR = 1005, 1006, -1   # t_video.status_code
 
 
-def _needs_roster(category: str) -> bool:
-    """명단 검색 대상 — 스포츠·드라마(사극 포함)만. 나머지 카테고리는 명단 없이 진행."""
-    return category.startswith("스포츠") or category.startswith("드라마")
+# 보강(enrichment) 대상 카테고리 — 명단 검색 + whisper 2차 전사를 여기서만 돈다.
+#   이 튜플 하나가 "어떤 영상을 보강할지"의 단일 기준. 카테고리 추가는 여기 한 줄.
+#   (뉴스·다큐는 1차 STT 가 이미 정확 → 보강 이득 없이 환각 위험만. 스킵)
+ENRICH_CATEGORIES = ("스포츠", "드라마")   # 사극은 "드라마-사극" 이라 startswith 로 포함
+
+
+def _needs_enrichment(category: str) -> bool:
+    """명단 검색·whisper 2차 대상 여부. roster 와 whisper 가 같은 이 판정을 공유한다
+    (한쪽만 도는 불일치를 구조적으로 차단)."""
+    return category.startswith(ENRICH_CATEGORIES)
 
 
 async def run(state, req) -> None:
@@ -43,11 +51,14 @@ async def run(state, req) -> None:
     stage = "0_prep"
 
     # WEB 검색 — STT 와 독립(제목/카테고리/연도만 필요)이라 '먼저' 띄워 prep+STT 시간에 숨긴다.
-    #   스포츠·드라마만 대상. STT(5~10분) 도는 동안 백그라운드로 진행 → 교정 직전 합류.
-    search_task = (
-        asyncio.create_task(web_search.search_web(state.vllm, req.title, req.year, req.category))
-        if req.title and _needs_roster(req.category) else None
-    )
+    #   보강 대상(스포츠·드라마)이고 제목이 있을 때만. STT(5~10분) 도는 동안 백그라운드로 진행.
+    
+    if _needs_enrichment(req.category) and req.title:
+        search_task = asyncio.create_task(
+            web_search.search_web(state.vllm, req.title, req.year, req.category))
+    else:
+        search_task = None    
+
     try:
         async with state.stt_sem:
             # FFMPEG — 영상-음성 분리 (덤프할 결과 없음)
@@ -74,18 +85,19 @@ async def run(state, req) -> None:
             except Exception:  # noqa: BLE001 — 명단 검색 실패는 스킵, 교정은 명단 없이
                 log.exception(f"[bg] v_id={v_id} 명단 검색 실패 — 명단 없이 진행")
 
-        # whisper 2차 전사 — 교정 때 대조할 '두 번째 의견'. 스포츠·드라마만, 대상 구간만.
+        # whisper 2차 전사 — 교정 때 대조할 '두 번째 의견'. roster 와 같은 대상(_needs_enrichment)만.
         #   명단에서 뽑은 등장인물을 initial_prompt 로 넘겨 이름 정확도를 올린다(stt2._prompt).
         #   실패해도 교정은 1차만으로 진행 (whisper 없으면 기존과 동일 동작)
         stage = "3_whisper"
         info.whisper_map = {}
-        try:
-            info.whisper_map = await asyncio.to_thread(
-                stt2.stt2, state.http, v_id, info.dialogue, req.category, info.search_result)
-            debug.dump(v_id, stage, info.whisper_map)
-            log.info(f"[bg] v_id={v_id} whisper 2차: {len(info.whisper_map)}건")
-        except Exception:  # noqa: BLE001 — 2차 전사 실패는 스킵, 교정은 1차만으로
-            log.exception(f"[bg] v_id={v_id} whisper 2차 실패 — 1차만으로 교정")
+        if _needs_enrichment(req.category):
+            try:
+                info.whisper_map = await asyncio.to_thread(
+                    stt2.stt2, state.http, v_id, info.dialogue, info.search_result)
+                debug.dump(v_id, stage, info.whisper_map)
+                log.info(f"[bg] v_id={v_id} whisper 2차: {len(info.whisper_map)}건")
+            except Exception:  # noqa: BLE001 — 2차 전사 실패는 스킵, 교정은 1차만으로
+                log.exception(f"[bg] v_id={v_id} whisper 2차 실패 — 1차만으로 교정")
 
         # 교정 (refine) — 1차 텍스트를 기준으로, whisper 2차와 명단을 참고자료로 대조 교정.
         #   whisper_map 이 비어 있으면(비대상/실패) 기존과 동일하게 1차만 교정한다.
@@ -115,10 +127,12 @@ async def run(state, req) -> None:
         await asyncio.to_thread(db_svc.save_result, info, STT_END)
         log.info(f"[bg] v_id={v_id} 완료: {len(info.kept)} dialogues")
 
-        # ⑦ 다음 단계 트리거 — agent-vision 분석 요청 (prep 응답의 청크 정보를 동봉)
-        # stage = "vision"
-        # await asyncio.to_thread(vision.agent_vision, state.http, v_id, True,
-        #                         prep_res.video_chunk_cnt, prep_res.video_chunk_last)
+        # ⑦ 다음 단계 트리거 — agent-vision 분석 요청.
+        #   config.VISION_TRIGGER(.env) 가 on 일 때만. off 면 STT 만 하고 끝(vision 미연동 등).
+        if config.VISION_TRIGGER:
+            stage = "vision"
+            await asyncio.to_thread(vision.agent_vision, state.http, v_id, True)
+            log.info(f"[bg] v_id={v_id} vision 트리거 완료")
 
     except Exception:  # noqa: BLE001 — 백그라운드라 응답으로 못 알림, 로그 + DB 상태로 보고
         log.exception(f"[bg] v_id={v_id} 실패 (stage={stage})")

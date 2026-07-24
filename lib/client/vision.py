@@ -3,6 +3,7 @@
 STT 자막을 DB 에 다 넣은 뒤, 영상 분석을 agent-vision 에 넘긴다:
   POST /api/v1/analyze  {v_id, force}
 
+agent-vision 은 v_id 로 필요한 걸 DB·NVMe 에서 직접 조회한다 — 여기선 트리거만 보낸다.
 httpx.Client(sync) 외부 주입 — prep_stt 와 동일하게 공유 클라이언트를 쓴다.
 """
 import httpx
@@ -20,22 +21,11 @@ ANALYZE_URL = f"{config.VISION_BASE_URL}/api/v1/analyze"
 class AnalyzeRequest(BaseModel):
     v_id: int
     force: bool = False
-    video_chunk_cnt: int = 0     # prep_svc 응답에서 옴
-    video_chunk_last: str = ""   # prep_svc 응답에서 옴 (마지막 청크 파일명)
 
 
-def agent_vision(http: httpx.Client, v_id: int, force: bool = False,
-                 video_chunk_cnt: int = 0, video_chunk_last: str = "") -> dict:
-    """agent-vision 에 분석 요청. POST ANALYZE_URL → 응답 JSON 반환.
-
-    영상청크 정보(video_chunk_cnt/last)는 prep_svc 응답(PreResponse)에서 온다 — 호출자가 꺼내 넘김.
-    """
-    body = AnalyzeRequest(
-        v_id=v_id,
-        force=force,
-        video_chunk_cnt=video_chunk_cnt,
-        video_chunk_last=video_chunk_last,
-    )
+def agent_vision(http: httpx.Client, v_id: int, force: bool = False) -> dict:
+    """agent-vision 에 분석 요청. POST ANALYZE_URL → 응답 JSON 반환."""
+    body = AnalyzeRequest(v_id=v_id, force=force)
     r = http.post(ANALYZE_URL, json=body.model_dump())
     r.raise_for_status()
     data = r.json()
