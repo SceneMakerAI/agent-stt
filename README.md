@@ -1,117 +1,119 @@
 # stt-agent
 
-Subtitle **correction pipeline orchestrator** (FastAPI) — the post-STT stage of the video pipeline.
-For one video (`v_id`), it chains audio extraction → STT → subtitle correction → DB write → next-stage trigger into a single request, replies immediately, and runs the work in the background.
+A **subtitle pipeline orchestrator** (FastAPI) for one video. Takes a `v_id`, runs the audio branch
+and the image branch in parallel, and saves to DB once both finish. HTTP replies `accepted`
+immediately; the work runs in the background.
 
 [한국어 README](README.ko.md)
 
-## Overview
+## The pipeline differs per category
 
-Given a `v_id` and a source `file_path`, `stt-agent` orchestrates the full correction
-flow across external services and writes the final subtitles to the database. The HTTP
-request is **accepted instantly**; the actual work runs in a background task.
+The core idea is the **category table** (`lib/svc/profile.py`). Step order is the same for every
+category — the table only decides **which steps run and what material they get**.
 
-The service exposes a single endpoint:
+| Category | Web search | 2nd pass ASR | Glossary | Summary | Frame detection |
+|---|---|---|---|---|---|
+| Sports-Baseball | O | O | baseball | ✕ | baseball |
+| Sports-Soccer | O | O | soccer | ✕ | soccer |
+| Drama | O | O | — | O | — |
+| Documentary · News | ✕ | ✕ | — | O | — |
 
-- **`POST /api/v1/stt_svc`** `{v_id, file_path}` — marks the video "processing", returns `accepted`, and dispatches the background pipeline.
+Unlisted categories fall back to their prefix (`드라마-사극` → `드라마`), then to a default.
+**This table is the only place that interprets the category string** — the pipeline and the steps
+only see the switches it hands them.
 
-## Pipeline
+## Flow
 
 ```
-POST /api/v1/stt_svc {v_id, file_path}
+POST /api/v1/stt_svc {v_id, file_path, title, category, year}
+        │  status 1001 (accepted) + immediate "accepted" response
         │
-        ├─ 1-1. DB status → 'processing' (1005)   → validate v_id (unknown → reply immediately)
-        │
-        └─ reply "accepted" immediately  ───────────┐
-                                                     │ (background process)
-   [2] prep    POST prep_stt /pre_svc/  → audio_path   (ffmpeg extract / chunk)
-   [3] stt     POST prep_stt /stt_svc/  → segments     (whisper STT, 5–10 min)
-   [4] correct vLLM (Qwen) per-page parallel correction → corrected
-   [5] save    DB t_dialogue INSERT + status → 'done' (1006)
-   [7] vision  POST agent-vision /api/v1/analyze        (trigger next stage)
+        └─ background (svc/pipeline)
+             profile.resolve(category)
+             (ffmpeg) source → audio.wav + frames/          ← shared prep for both branches
+                    ├── audio branch  (search) → ASR → (2nd pass) → correct → hallu → (summary)
+                    └── image branch  detection worker (per sport)
+                              ↓ join
+                          one transaction → status 1006 (done) → agent-vision trigger
 ```
 
-- **prep/stt** live on the same server (prep_stt). STT is whisper (GPU), one job at a time → bounded by a semaphore.
-- Only **correction (4)** is async (per-page parallel); the other blocking calls go through `asyncio.to_thread` so they never block the event loop.
+- **ffmpeg is not a branch** — it produces the material for both, so it finishes before the
+  fan-out. Inside a branch, detection would be called before any frame exists and get rejected.
+- The two branches hit **GPUs on different boxes**, so they really do run in parallel.
+- **Both matter** — if either fails, the other is cancelled and everything rolls back (status `-1`).
+  A half-saved video can't be told apart from a finished one.
+- Blocking calls (worker HTTP, DB) go through `asyncio.to_thread` so the event loop stays free.
+- The final **agent-vision trigger** only fires when `VISION_TRIGGER` is on in `.env`. It runs after
+  the save, so a failure there is logged but never flips a finished video back to failed.
+
+## Source layout (rough)
+
+```
+main.py / config.py
+lib/
+  http/      intake router — backpressure + status 1001 only; hands the work to svc
+  svc/       the pipeline. pipeline.py (whole run) + profile.py (category table)
+             ffmpeg/ audio/ image/ rdb/ — branches and steps; one pipe_*.py entry per directory
+  client/    outbound calls only (ASR, search engine, detection worker, vLLM, MariaDB) — no policy
+```
+
+Files are named `<function>_<module>.py` — `pipe_search.py` / `vllm_hallu.py` / `util_correct.py` /
+`schema_dialogue.py`. Everything flowing through the pipeline is a dataclass (`svc/**/schema_*.py`).
 
 ## Design notes
 
-- **Single endpoint** `POST /api/v1/stt_svc` — replies on arrival, processes via `BackgroundTasks`.
-- **Shared resources** (vLLM client / httpx / semaphore / counter) are created once in `lifespan` and shared via `app.state`. The vLLM `AsyncOpenAI` client binds to the uvicorn event loop.
-- **Concurrency control** (semaphores):
-  - `STT_CONCURRENCY` — max concurrent prep+stt jobs (protects the GPU)
-  - `VLLM_CONCURRENCY` — max concurrent correction calls (semaphore inside vLLM `chat()`)
-- **Backpressure** — when the pending queue exceeds `MAX_REQ_CNT`, new requests are rejected with **429** (avoids an unbounded queue).
-- **Stage tracking** — background failures log the `stage` (prep/stt/correct/save/vision).
-
-## Project layout
-
-```
-main.py                 FastAPI app + lifespan (shared resources) + router registration
-config.py               .env loading + settings
-test.sh                 local curl test
-lib/
-  http/
-    stt_svc.py          router + request DTO + background process (pipeline assembly)
-    http_util.py        request/response logging middleware
-  client/               external service calls (1 service = 1 module)
-    db.py               MariaDB (status update + subtitle INSERT)
-    prep_stt.py         prep_stt server (pre_svc/ffmpeg, stt)
-    vllm.py             vLLM (Qwen) correction client
-    vision.py           agent-vision trigger
-  correct/              subtitle correction logic
-    corrector.py        segments → corrected (per-page parallel)
-    chunk.py            segments → page split
-    prompt.py           correction prompt
-  debug.py              per-step dump (inspection, write-only)
-  log.py                shared logger (file + console)
-```
+- **Single endpoint** `POST /api/v1/stt_svc` — respond on arrival, run via `BackgroundTasks`.
+- **Shared resources** (vLLM client / httpx / semaphores / counter) are built once in `lifespan`
+  and shared through `app.state`.
+- **Concurrency** — `MAX_REQ_CNT` caps both intake and the per-worker semaphores (429 beyond it).
+  Only vLLM has its own limit (`VLLM_CONCURRENCY`).
+- **Save atomicity** — the transaction is opened in exactly one place (`svc/rdb/save_svc.py`);
+  failures raise so the whole thing rolls back.
+- **Stage tracking** — failures log the `stage` (ffmpeg/stt/correct/…).
 
 ## Configuration (.env)
 
-Copy `.env.example` to `.env` and fill in the values.
+Copy `.env.example` to `.env` and fill it in.
 
 | Key | Description |
 |---|---|
-| `HOST` / `PORT` | this server's (FastAPI) bind address/port |
-| `STT_HOST` / `STT_PORT` | prep_stt server (pre_svc + stt) |
-| `VLLM_HOST` / `VLLM_PORT` | vLLM (Qwen) correction server |
-| `RDB_HOST` / `RDB_PORT` / `RDB_USER` / `RDB_PW` / `RDB_NAME` | MariaDB |
-| `VISION_HOST` / `VISION_PORT` | agent-vision server |
-| `DEBUG_DIR` | dump path for intermediate results |
+| `HOST` / `PORT` | bind address/port for this server |
+| `STT_HOST` / `STT_PORT` | prep_stt worker (ffmpeg + 1st/2nd pass ASR) |
+| `VLLM_HOST` / `VLLM_PORT` | vLLM (Qwen) — search, correction, hallucination filter, summary |
+| `IMG_MODELS_HOST` / `IMG_MODELS_PORT` | frame detection worker (worker-img_models) |
+| `RDB_*` | MariaDB |
+| `VISION_HOST` / `VISION_PORT` / `VISION_TRIGGER` | next-stage (agent-vision) trigger |
+| `DUMP_DIR` / `DUMP_STEPS_*` | per-step dumps for inspection (write-only) |
 
-## Run
+> ⚠ `.env` holds the DB password — never commit it (it is in `.gitignore`).
+
+## Running
 
 ```bash
-uv sync                                              # install dependencies
-uv run uvicorn main:app --host 0.0.0.0 --port 8000   # run (--reload for dev)
+uv sync
+uv run uvicorn main:app --host 0.0.0.0 --port 19010   # add --reload for development
 ```
 
-## Test
+## Testing
 
 ```bash
-./test.sh                          # defaults to v_id=1
-./test.sh 3 output/3/audio.wav     # specify v_id, file_path
-BASE=http://localhost:8000 ./test.sh
-
-# one-liner
-curl -sS -X POST http://localhost:8000/api/v1/stt_svc \
+curl -sS -X POST http://localhost:19010/api/v1/stt_svc \
   -H 'Content-Type: application/json' \
-  -d '{"v_id":1,"file_path":"output/1/audio.wav"}'
+  -d '{"v_id":1,"file_path":"vod/1/1.mp4","title":"코리안시리즈 KIA vs SK",
+       "category":"스포츠-야구","year":2009}'
 ```
 
 Responses:
 ```json
-{"v_id": 1, "status": "accepted"}        // accepted (processed in background)
-{"v_id": 1, "status": "Not found v_id"}  // v_id not in t_video
+{"v_id": 1, "status": "accepted"}        // queued (pipeline runs in background)
+{"v_id": 1, "status": "Not found v_id"}  // no such v_id in t_video
 // 429 — queue full (Retry-After header)
 ```
 
 ## Requirements
 
-- Python >= 3.13
-- [uv](https://docs.astral.sh/uv/)
-- External services: prep_stt, vLLM (Qwen), MariaDB, agent-vision
+- Python >= 3.13, [uv](https://docs.astral.sh/uv/)
+- External services: prep_stt worker, vLLM (Qwen), worker-img_models, MariaDB, agent-vision (optional)
 
 ## License
 

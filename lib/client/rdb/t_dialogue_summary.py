@@ -1,11 +1,9 @@
-"""t_dialogue_summary CRUD — 커서 + info 받아 동작 (connect 는 db_svc 가 관리).
+"""t_dialogue_summary CRUD — 커서를 받아 동작 (connect 는 저장 조합이 관리).
 
-1분 구간 요약(summarizer 산출물)을 저장. 멱등: DELETE 후 일괄 INSERT.
+구간 요약(Summary.sections)을 저장. 멱등 저장은 delete_insert() 하나로.
 
-info 는 SttInfo 를 그대로 받되 import 하지 않고 속성만 읽는다(덕타이핑) — client(rdb)가
-svc(SttInfo)에 하드 의존하지 않게. 꺼내 쓰는 것: info.v_id, info.segments.
-  segments: [{start_sec, end_sec, summary}, ...]  (summarizer 산출물)
-  window_sec 는 구간 span(end_sec-start_sec)에서 계산.
+svc 타입을 import 하지 않고 속성만 읽는다(덕타이핑).
+  window_sec 컬럼은 구간 span(end_sec-start_sec)에서 계산한다 — 따로 안 받는다.
 """
 from lib.client.rdb.db_util import sec_to_time
 from lib.log import get_logger
@@ -18,18 +16,28 @@ def delete(cur, vid: int) -> int:
     return cur.execute("DELETE FROM t_dialogue_summary WHERE v_id=%s", (vid,))
 
 
-def insert(cur, info) -> int:
-    """info.segments → 멱등 저장 (DELETE 후 INSERT). 반환: INSERT 행 수."""
-    vid = info.v_id
+def insert(cur, vid: int, summary) -> int:
+    """Summary.sections → INSERT. 반환: INSERT 행 수."""
     rows = [
-        (vid, seq, sec_to_time(s["start_sec"]), sec_to_time(s["end_sec"]),
-         s["end_sec"] - s["start_sec"], s.get("summary") or "")
-        for seq, s in enumerate(info.segments or [])
+        (vid, seq, sec_to_time(s.start_sec), sec_to_time(s.end_sec),
+         s.end_sec - s.start_sec, s.summary)
+        for seq, s in enumerate(summary.sections)
     ]
-    delete(cur, vid)
     if rows:
         cur.executemany(
-            f"INSERT INTO t_dialogue_summary (v_id, seq, start_time, end_time, window_sec, summary) VALUES (%s, %s, %s, %s, %s, %s)",
+            "INSERT INTO t_dialogue_summary "
+            "(v_id, seq, start_time, end_time, window_sec, summary) "
+            "VALUES (%s, %s, %s, %s, %s, %s)",
             rows,
         )
     return len(rows)
+
+
+def delete_insert(cur, vid: int, summary) -> int:
+    """멱등 저장 — 지우고 다시 넣는다. 반환: 넣은 행 수 (0 가능).
+
+    실패는 예외로 올린다 — save_svc 의 트랜잭션이 통째 rollback 되고 그 영상은 실패로 남는다.
+    저장은 대안이 없어서(부분 저장은 무의미) 호출자가 판단할 게 없다.
+    """
+    delete(cur, vid)
+    return insert(cur, vid, summary)

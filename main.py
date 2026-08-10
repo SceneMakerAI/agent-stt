@@ -15,7 +15,6 @@ vLLM 클라이언트(AsyncOpenAI)는 lifespan 안에서 생성돼 uvicorn 이벤
 
 실행:  uv run uvicorn main:app --host 0.0.0.0 --port 8002 --reload
 """
-import asyncio
 import ssl
 from contextlib import asynccontextmanager
 
@@ -44,11 +43,9 @@ async def lifespan(app: FastAPI):
     app.state.vllm = vllm.build()
     app.state.http = httpx.Client(timeout=httpx.Timeout(30.0))
 
-    # 현재 접속한 사용자 수
+    # 현재 접속한 사용자 수 — 동시성 상한은 이 카운터(MAX_REQ_CNT) 하나로만 잡는다.
+    #   요청 1건이 워커마다 한 번씩만 부르므로, 접수를 막으면 워커 호출도 같이 막힌다.
     app.state.current_req_cnt = 0
-
-    # prep+stt 동시성 상한 — 전역 1개(GPU).
-    app.state.stt_sem = asyncio.Semaphore(config.STT_CONCURRENCY)
 
     log.info(f"stt_agent up: {config.HOST}:{config.PORT}")
     yield

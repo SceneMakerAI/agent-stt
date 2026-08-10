@@ -1,6 +1,20 @@
-# ── 환경변수 (DB 비밀번호 등 비밀값 포함 — 절대 커밋 금지)
+# ── 비밀값 (절대 커밋 금지)
 .env
-.pem
+.env.*
+!.env.example
+
+# 인증서 / 개인키 — 확장자 전체를 막는다.
+#   ⚠ '.pem' 이라고만 쓰면 '.pem' 이라는 이름의 파일만 걸리고 'xxx.pem' 은 안 걸린다
+*.pem
+*.key
+*.crt
+*.cer
+*.der
+*.p12
+*.pfx
+*.jks
+id_rsa*
+id_ed25519*
 
 # ── Python
 __pycache__/
@@ -27,6 +41,3 @@ output/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-
-
-CAST.md

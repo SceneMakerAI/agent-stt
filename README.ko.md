@@ -1,70 +1,72 @@
 # stt-agent
 
-STT 자막 **교정 파이프라인 오케스트레이터** (FastAPI) — 영상 파이프라인의 STT 이후 단계.
-영상 1개(`v_id`)에 대해 음성 추출 → STT → 자막 교정 → DB 저장 → 다음 단계 트리거를 한 요청으로 조립하고, 즉시 응답한 뒤 실제 공정은 백그라운드에서 처리한다.
+영상 1건의 **자막 공정 오케스트레이터** (FastAPI). `v_id` 하나를 받아 음성 갈래와 이미지 갈래를
+병렬로 돌리고, 둘 다 끝나면 DB 에 저장한다. HTTP 는 즉시 `accepted` 로 응답하고 실제 공정은
+백그라운드에서 돈다.
 
 [English README](README.md)
 
-## 개요
+## 카테고리마다 공정이 다르다
 
-`v_id` 와 원본 `file_path` 를 받아, 외부 서비스들을 거치는 교정 공정 전체를 조립하고
-최종 자막을 DB 에 저장한다. HTTP 요청은 **즉시 접수 응답**하고, 실제 작업은 백그라운드에서 돈다.
+핵심 개념은 **카테고리 표**(`lib/svc/profile.py`)다. 스텝 순서는 어느 카테고리든 같고,
+**무엇을 켜고 무슨 재료를 줄지**만 표가 정한다.
 
-단일 엔드포인트를 제공한다:
+| 카테고리 | 웹검색 | 2차 전사 | 용어집 | 요약 | 이미지 검출 |
+|---|---|---|---|---|---|
+| 스포츠-야구 | O | O | 야구 | ✕ | baseball |
+| 스포츠-축구 | O | O | 축구 | ✕ | soccer |
+| 드라마 | O | O | — | O | — |
+| 다큐 · 뉴스 | ✕ | ✕ | — | O | — |
 
-- **`POST /api/v1/stt_svc`** `{v_id, file_path}` — 상태를 '처리중'으로 바꾸고 `accepted` 를 반환한 뒤, 백그라운드 파이프라인을 dispatch 한다.
+표에 없는 카테고리는 대분류(`드라마-사극` → `드라마`)로, 그것도 없으면 기본값으로 떨어진다.
+**카테고리 문자열을 해석하는 곳은 이 표 하나**이고, 파이프라인과 스텝들은 표가 넘긴 스위치만 본다.
 
 ## 파이프라인
 
 ```
-POST /api/v1/stt_svc {v_id, file_path}
+POST /api/v1/stt_svc {v_id, file_path, title, category, year}
+        │  상태 1001(접수) + 즉시 "accepted" 응답
         │
-        ├─ 1-1. DB 상태 → '처리중'(1005)   → v_id 검증 (없으면 즉시 응답)
-        │
-        └─ 즉시 "accepted" 응답  ───────────────┐
-                                                 │ (백그라운드 process)
-   [2] prep    POST prep_stt /pre_svc/  → audio_path   (ffmpeg 추출/분할)
-   [3] stt     POST prep_stt /stt_svc/  → segments     (whisper STT, 5~10분)
-   [4] correct vLLM(Qwen) 페이지 병렬 교정 → corrected
-   [5] save    DB t_dialogue INSERT + 상태 → '완료'(1006)
-   [7] vision  POST agent-vision /api/v1/analyze       (다음 단계 트리거)
+        └─ 백그라운드 (svc/pipeline)
+             profile.resolve(category)
+             (ffmpeg) 원본 → 음성(audio.wav) + 프레임(frames/)     ← 두 갈래 공통 선행
+                    ├── 음성 갈래  (검색) → STT → (2차 전사) → 교정 → 할루시 → (요약)
+                    └── 이미지 갈래 검출 워커(종목별)
+                              ↓ join
+                          한 트랜잭션 저장 → 상태 1006(완료) → agent-vision 트리거
 ```
 
-- **prep/stt** 는 같은 서버(prep_stt). STT 는 whisper(GPU) 라 한 번에 1 job → 세마포어로 제한.
-- **교정(4)** 만 async(페이지 병렬), 나머지 블로킹 호출은 `asyncio.to_thread` 로 이벤트루프를 막지 않는다.
+- **ffmpeg 는 갈래가 아니다** — 두 갈래의 재료를 모두 만들므로 먼저 끝내고 나서 갈래를 띄운다.
+  갈래 안에 넣으면 프레임이 없는 채로 검출 워커를 불러 거절당한다.
+- 두 갈래는 **서로 다른 서버의 GPU** 를 쓰므로 실제로 병렬로 돈다.
+- **둘 다 중요하다** — 어느 쪽이 실패하든 나머지를 취소하고 통째 rollback, 상태 `-1`.
+  반쪽만 저장하면 그 영상이 완료인지 알 수 없기 때문.
+- 블로킹 호출(워커 HTTP, DB)은 전부 `asyncio.to_thread` 로 넘겨 이벤트루프를 막지 않는다.
+- 마지막 **agent-vision 트리거**는 `.env` 의 `VISION_TRIGGER` 가 on 일 때만. 저장이 끝난 뒤라
+  실패해도 완료를 뒤집지 않고 로그만 남긴다.
+
+## 소스 구조 (대략)
+
+```
+main.py / config.py
+lib/
+  http/      접수 라우터 — 백프레셔·상태 1001 만 하고 공정은 svc 로 넘긴다
+  svc/       공정. pipeline.py(전체) + profile.py(카테고리 표)
+             ffmpeg/ audio/ image/ rdb/ — 갈래와 스텝. 디렉토리마다 진입점은 pipe_*.py 하나
+  client/    외부 호출만 (STT·검색엔진·검출워커·vLLM·MariaDB). 정책은 안 갖는다
+```
+
+파일명은 `<기능>_<모듈>.py` 규칙이다 — `pipe_search.py` / `vllm_hallu.py` / `util_correct.py` /
+`schema_dialogue.py`. 공정을 흐르는 값은 전부 dataclass 로 정의돼 있다(`svc/**/schema_*.py`).
 
 ## 설계 요점
 
-- **단일 엔드포인트** `POST /api/v1/stt_svc` — 받자마자 응답, 공정은 `BackgroundTasks` 로 처리.
-- **공유 리소스** (vLLM 클라이언트 / httpx / 세마포어 / 카운터)는 `lifespan` 에서 1회 생성해 `app.state` 로 공유. vLLM 의 `AsyncOpenAI` 는 uvicorn 이벤트루프에 바인딩된다.
-- **동시성 제어** (세마포어):
-  - `STT_CONCURRENCY` — prep+stt 동시 처리 상한 (GPU 보호)
-  - `VLLM_CONCURRENCY` — 교정 페이지 동시 호출 상한 (vLLM `chat()` 내부 세마포어)
-- **백프레셔** — 접수 대기열이 `MAX_REQ_CNT` 를 넘으면 **429** 로 거절(무한 대기열 방지).
-- **단계 추적** — 백그라운드 실패 시 `stage`(prep/stt/correct/save/vision) 를 로그에 남긴다.
-
-## 프로젝트 구조
-
-```
-main.py                 FastAPI app + lifespan(공유 리소스) + 라우터 등록
-config.py               .env 로딩 + 설정값
-test.sh                 로컬 curl 테스트
-lib/
-  http/
-    stt_svc.py          라우터 + 요청 DTO + 백그라운드 process(공정 조립)
-    http_util.py        요청/응답 로깅 미들웨어
-  client/               외부 서비스 호출 (1 서비스 = 1 모듈)
-    db.py               MariaDB (상태 갱신 + 자막 INSERT)
-    prep_stt.py         prep_stt 서버 (pre_svc/ffmpeg, stt)
-    vllm.py             vLLM(Qwen) 교정 클라이언트
-    vision.py           agent-vision 트리거
-  correct/              자막 교정 로직
-    corrector.py        segments → corrected (페이지 병렬)
-    chunk.py            segments → 페이지 분할
-    prompt.py           교정 프롬프트
-  debug.py              단계별 중간 결과 덤프 (검수용, write-only)
-  log.py                공용 로거 (파일 + 콘솔)
-```
+- **단일 엔드포인트** `POST /api/v1/stt_svc` — 받자마자 응답, 공정은 `BackgroundTasks`.
+- **공유 리소스**(vLLM 클라이언트 / httpx / 세마포어 / 카운터)는 `lifespan` 에서 1회 생성해 `app.state` 로.
+- **동시성** — `MAX_REQ_CNT` 하나로 접수 상한과 워커별 세마포어를 함께 잡는다(초과 접수는 429).
+  vLLM 만 `VLLM_CONCURRENCY` 로 따로 제한.
+- **저장 원자성** — 트랜잭션은 `svc/rdb/save_svc.py` 한 곳에서만 연다. 실패는 예외로 올려 rollback.
+- **단계 추적** — 실패 시 `stage`(ffmpeg/stt/correct/…)를 로그에 남긴다.
 
 ## 설정 (.env)
 
@@ -72,33 +74,30 @@ lib/
 
 | 키 | 설명 |
 |---|---|
-| `HOST` / `PORT` | 이 서버(FastAPI) 바인드 주소/포트 |
-| `STT_HOST` / `STT_PORT` | prep_stt 서버 (pre_svc + stt) |
-| `VLLM_HOST` / `VLLM_PORT` | vLLM(Qwen) 교정 서버 |
-| `RDB_HOST` / `RDB_PORT` / `RDB_USER` / `RDB_PW` / `RDB_NAME` | MariaDB |
-| `VISION_HOST` / `VISION_PORT` | agent-vision 서버 |
-| `DEBUG_DIR` | 중간 결과 덤프 경로 |
+| `HOST` / `PORT` | 이 서버 바인드 주소/포트 |
+| `STT_HOST` / `STT_PORT` | prep_stt 워커 (ffmpeg + 1·2차 전사) |
+| `VLLM_HOST` / `VLLM_PORT` | vLLM(Qwen) — 검색·교정·할루시·요약 |
+| `IMG_MODELS_HOST` / `IMG_MODELS_PORT` | 프레임 검출 워커 (worker-img_models) |
+| `RDB_*` | MariaDB |
+| `VISION_HOST` / `VISION_PORT` / `VISION_TRIGGER` | 다음 단계(agent-vision) 트리거 |
+| `DUMP_DIR` / `DUMP_STEPS_*` | 단계별 중간 결과 덤프 (검수용, write-only) |
 
 > ⚠ `.env` 는 DB 비밀번호를 포함하므로 커밋하지 않는다 (`.gitignore` 에 포함됨).
 
 ## 실행
 
 ```bash
-uv sync                                              # 의존성 설치
-uv run uvicorn main:app --host 0.0.0.0 --port 8000   # 서버 실행 (--reload 로 개발)
+uv sync
+uv run uvicorn main:app --host 0.0.0.0 --port 19010   # --reload 로 개발
 ```
 
 ## 테스트
 
 ```bash
-./test.sh                          # 기본 v_id=1
-./test.sh 3 output/3/audio.wav     # v_id, file_path 지정
-BASE=http://localhost:8000 ./test.sh
-
-# 한 줄 (복붙용)
-curl -sS -X POST http://localhost:8000/api/v1/stt_svc \
+curl -sS -X POST http://localhost:19010/api/v1/stt_svc \
   -H 'Content-Type: application/json' \
-  -d '{"v_id":1,"file_path":"output/1/audio.wav"}'
+  -d '{"v_id":1,"file_path":"vod/1/1.mp4","title":"코리안시리즈 KIA vs SK",
+       "category":"스포츠-야구","year":2009}'
 ```
 
 응답:
@@ -110,9 +109,8 @@ curl -sS -X POST http://localhost:8000/api/v1/stt_svc \
 
 ## 요구사항
 
-- Python >= 3.13
-- [uv](https://docs.astral.sh/uv/)
-- 외부 서비스: prep_stt, vLLM(Qwen), MariaDB, agent-vision
+- Python >= 3.13, [uv](https://docs.astral.sh/uv/)
+- 외부 서비스: prep_stt 워커, vLLM(Qwen), worker-img_models, MariaDB, agent-vision(선택)
 
 ## 라이선스
 

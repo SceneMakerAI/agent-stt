@@ -41,9 +41,17 @@ VISION_BASE_URL = f"http://{VISION_HOST}:{VISION_PORT}"
 #   ("true"/"1"/"on"/"yes" → on, 대소문자 무관. 그 외/미설정 → off)
 VISION_TRIGGER = os.getenv("VISION_TRIGGER", "false").strip().lower() in ("true", "1", "on", "yes")
 
+# ── 이미지 검출 워커 (worker-img_models) — 종목별 엔드포인트 /sport/{baseball,soccer}
+IMG_MODELS_HOST = os.getenv("IMG_MODELS_HOST")
+IMG_MODELS_PORT = int(os.getenv("IMG_MODELS_PORT"))
+IMG_MODELS_BASE_URL = f"http://{IMG_MODELS_HOST}:{IMG_MODELS_PORT}"
+IMG_MODELS_TIMEOUT_S = 60*20   # 프레임 12,586장 추론이 4분대 — 넉넉히
+
 # ── 동시성 제한 / 백프레셔
-MAX_REQ_CNT = 5              # 접수 대기열 상한 (running + 대기). 초과 시 429 거절
-STT_CONCURRENCY = 2          # prep+stt 동시 처리 상한 (whisper GPU 1개라 1)
+# 이 에이전트가 동시에 안고 있을 요청 수. 초과 접수는 429 거절.
+#   워커별 동시 호출 상한(음성·이미지 세마포어)도 이 값을 쓴다 — 운영하며 워커가 버거우면
+#   그때 워커별로 쪼갠다. 지금은 손잡이를 하나로 둔다.
+MAX_REQ_CNT = 5
 
 # ── vLLM 동시성 — 클라이언트 전역 세마포어 (교정·검색 등 모든 vllm 호출이 공유)
 VLLM_CONCURRENCY = 8          # 동시 vLLM 호출 상한 (lib/client/vllm.py 가 사용)
