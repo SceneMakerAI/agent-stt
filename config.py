@@ -17,8 +17,8 @@ PORT = int(os.getenv("PORT"))
 STT_HOST = os.getenv("STT_HOST")
 STT_PORT = int(os.getenv("STT_PORT"))
 PREP_STT_BASE_URL = f"http://{STT_HOST}:{STT_PORT}"
-PREP_TIMEOUT_S = 60*5          # prep(ffmpeg) 대기(초) 
-STT_TIMEOUT_S = 60*10          # STT 최대 대기(초) 
+PREP_TIMEOUT_S = 60*20          # prep(ffmpeg) 대기(초) 
+STT_TIMEOUT_S = 60*30          # STT 최대 대기(초) 
 
 # 자막 교정용
 VLLM_HOST = os.getenv("VLLM_HOST")
