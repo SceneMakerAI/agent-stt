@@ -15,6 +15,7 @@ vLLM 클라이언트(AsyncOpenAI)는 lifespan 안에서 생성돼 uvicorn 이벤
 
 실행:  uv run uvicorn main:app --host 0.0.0.0 --port 8002 --reload
 """
+import socket
 import ssl
 from contextlib import asynccontextmanager
 
@@ -29,6 +30,13 @@ from lib.log import get_logger
 
 log = get_logger(__name__)
 
+KEEPALIVE_SOCKET_OPTIONS = [
+    (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+    (socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60*2),
+    (socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 30),
+    (socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 5),
+]
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -39,9 +47,15 @@ async def lifespan(app: FastAPI):
 
     # 공유 리소스 — uvicorn 이벤트루프 위에서 1회 생성해 app.state 로 공유.
     #   vllm  : AsyncOpenAI 가 '지금 이 루프'에 바인딩됨 → 교정(④)을 같은 루프에서 await.
-    #   http  : STT 호출용 sync 클라이언트 (블로킹 호출은 service 가 to_thread 로 넘김).
+    #   http  : 워커 호출용 sync 클라이언트 (블로킹 호출은 svc 가 to_thread 로 넘김).
+    #           keepalive 를 켜야 긴 추론 중에 NAT 가 연결을 끊지 않는다.
+    #           timeout 30초는 기본값 — 오래 걸리는 호출은 각 client 가 직접 넘긴다
+    #           (PREP_TIMEOUT_S / STT_TIMEOUT_S / IMG_MODELS_TIMEOUT_S).
     app.state.vllm = vllm.build()
-    app.state.http = httpx.Client(timeout=httpx.Timeout(30.0))
+    app.state.http = httpx.Client(
+        timeout=httpx.Timeout(30.0),
+        transport=httpx.HTTPTransport(socket_options=KEEPALIVE_SOCKET_OPTIONS),
+    )
 
     # 현재 접속한 사용자 수 — 동시성 상한은 이 카운터(MAX_REQ_CNT) 하나로만 잡는다.
     #   요청 1건이 워커마다 한 번씩만 부르므로, 접수를 막으면 워커 호출도 같이 막힌다.
