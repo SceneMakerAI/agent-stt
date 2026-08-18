@@ -37,22 +37,22 @@ class Profile:
 #   summary          요약. 스포츠는 줄거리가 의미 없어 끈다
 #   스텝은 전부 적는다 — 기본값에 기대지 않아야 표만 보고 공정을 알 수 있다.
 TABLE: dict[str, Profile] = {
-    "스포츠-야구": Profile(ffmpeg=False, image="baseball",
+    "스포츠-야구": Profile(ffmpeg=True, image="baseball",
                       audio=Audio(search=True, stt_qwen=True, stt_whisper=True,   correct=True,
                                   correct_glossary=True, hallu=True, summary=False)),
-    "스포츠-축구": Profile(ffmpeg=False, image="soccer",
+    "스포츠-축구": Profile(ffmpeg=True, image="soccer",
                       audio=Audio(search=True, stt_qwen=True, stt_whisper=True,   correct=True,
                                   correct_glossary=True, hallu=True, summary=False)),
-    "스포츠":     Profile(ffmpeg=False,
+    "스포츠":     Profile(ffmpeg=True,
                       audio=Audio(search=True, stt_qwen=True, stt_whisper=True,   correct=True,
                                   correct_glossary=True, hallu=True, summary=False)),
-    "드라마":     Profile(ffmpeg=False,
+    "드라마":     Profile(ffmpeg=True,
                       audio=Audio(search=True, stt_qwen=True, stt_whisper=True,   correct=True,
                                   correct_glossary=True, hallu=True, summary=True)),
-    "다큐":       Profile(ffmpeg=False,
+    "다큐":       Profile(ffmpeg=True,
                       audio=Audio(search=False, stt_qwen=True, stt_whisper=False, correct=True,
                                   correct_glossary=False, hallu=True, summary=True)),
-    "뉴스":       Profile(ffmpeg=False,
+    "뉴스":       Profile(ffmpeg=True,
                       audio=Audio(search=False, stt_qwen=True, stt_whisper=False, correct=True,
                                   correct_glossary=False, hallu=True, summary=True)),
 }
