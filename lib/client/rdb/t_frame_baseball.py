@@ -1,4 +1,4 @@
-"""t_frame_adv CRUD — 커서를 받아 동작 (connect 는 저장 조합이 관리).
+"""t_frame_baseball CRUD — 커서를 받아 동작 (connect 는 저장 조합이 관리).
 
 프레임별 분류 결과(야구/광고·투구·보드종류)와 필수항목 개수를 저장. 멱등 저장은 delete_insert() 하나로.
 
@@ -13,7 +13,7 @@ log = get_logger(__name__)
 
 def delete(cur, vid: int) -> int:
     """v_id 의 프레임 분류 전체 삭제. 반환: 삭제 행 수."""
-    return cur.execute("DELETE FROM t_frame_adv WHERE v_id=%s", (vid,))
+    return cur.execute("DELETE FROM t_frame_baseball WHERE v_id=%s", (vid,))
 
 
 def insert(cur, vid: int, video) -> int:
@@ -25,7 +25,7 @@ def insert(cur, vid: int, video) -> int:
     ]
     if rows:
         cur.executemany(
-            "INSERT INTO t_frame_adv "
+            "INSERT INTO t_frame_baseball "
             "(v_id, `idx`, idx_time, idx_sec, `normal`, pitch, board_type, detect_major_obj) "
             "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
             rows,

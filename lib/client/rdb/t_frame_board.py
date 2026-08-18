@@ -1,4 +1,4 @@
-"""t_frame_board CRUD — 커서를 받아 동작 (connect 는 저장 조합이 관리).
+"""t_frame_baseball_board CRUD — 커서를 받아 동작 (connect 는 저장 조합이 관리).
 
 프레임별 스코어보드 박스 하나를 저장. 멱등 저장은 delete_insert() 하나로.
 
@@ -12,7 +12,7 @@ log = get_logger(__name__)
 
 def delete(cur, vid: int) -> int:
     """v_id 의 보드 박스 전체 삭제. 반환: 삭제 행 수."""
-    return cur.execute("DELETE FROM t_frame_board WHERE v_id=%s", (vid,))
+    return cur.execute("DELETE FROM t_frame_baseball_board WHERE v_id=%s", (vid,))
 
 
 def insert(cur, vid: int, video) -> int:
@@ -25,7 +25,7 @@ def insert(cur, vid: int, video) -> int:
     ]
     if rows:
         cur.executemany(
-            "INSERT INTO t_frame_board "
+            "INSERT INTO t_frame_baseball_board "
             "(v_id, `idx`, idx_time, idx_sec, board, score, x, y, w, h) "
             "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
             rows,

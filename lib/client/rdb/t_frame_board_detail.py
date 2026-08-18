@@ -1,4 +1,4 @@
-"""t_frame_board_detail CRUD — 커서를 받아 동작 (connect 는 저장 조합이 관리).
+"""t_frame_baseball_board_detail CRUD — 커서를 받아 동작 (connect 는 저장 조합이 관리).
 
 프레임 하나당 보드 세부 항목 6개(kind 별 1행)를 저장. 멱등 저장은 delete_insert() 하나로.
 프레임 7천 장이면 4만 행이라 CHUNK 씩 나눠 넣는다.
@@ -19,7 +19,7 @@ CHUNK = 5000   # executemany 한 번에 보낼 행 수 (패킷 크기 보호)
 
 def delete(cur, vid: int) -> int:
     """v_id 의 보드 세부 전체 삭제. 반환: 삭제 행 수."""
-    return cur.execute("DELETE FROM t_frame_board_detail WHERE v_id=%s", (vid,))
+    return cur.execute("DELETE FROM t_frame_baseball_board_detail WHERE v_id=%s", (vid,))
 
 
 def insert(cur, vid: int, video) -> int:
@@ -30,7 +30,7 @@ def insert(cur, vid: int, video) -> int:
             d = getattr(f.BOARD_DETAIL_DETECT, kind)
             rows.append((vid, f.idx, kind.upper(), f.idx_time, f.idx_sec,
                          d.detect, d.score, d.x, d.y, d.w, d.h))
-    sql = ("INSERT INTO t_frame_board_detail "
+    sql = ("INSERT INTO t_frame_baseball_board_detail "
            "(v_id, `idx`, kind, idx_time, idx_sec, detect, score, x, y, w, h) "
            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)")
     for i in range(0, len(rows), CHUNK):

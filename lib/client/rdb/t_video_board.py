@@ -1,4 +1,4 @@
-"""t_video_board CRUD — 커서를 받아 동작 (connect 는 저장 조합이 관리).
+"""t_video_board_baseball CRUD — 커서를 받아 동작 (connect 는 저장 조합이 관리).
 
 영상 하나의 **고정 박스** 7개(kind 별 1행)를 저장. 멱등 저장은 delete_insert() 하나로.
 프레임마다 흔들리는 박스를 전 프레임에서 굳힌 값이라, 프레임 테이블이 아니라 영상 단위다.
@@ -13,7 +13,7 @@ log = get_logger(__name__)
 
 def delete(cur, vid: int) -> int:
     """v_id 의 고정 박스 전체 삭제. 반환: 삭제 행 수."""
-    return cur.execute("DELETE FROM t_video_board WHERE v_id=%s", (vid,))
+    return cur.execute("DELETE FROM t_video_board_baseball WHERE v_id=%s", (vid,))
 
 
 def insert(cur, vid: int, video) -> int:
@@ -27,7 +27,7 @@ def insert(cur, vid: int, video) -> int:
             for b in (getattr(adjust, kind),)]
     if rows:
         cur.executemany(
-            "INSERT INTO t_video_board (v_id, kind, x, y, w, h) "
+            "INSERT INTO t_video_board_baseball (v_id, kind, x, y, w, h) "
             "VALUES (%s, %s, %s, %s, %s, %s)",
             rows,
         )
