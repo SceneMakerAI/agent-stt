@@ -30,9 +30,12 @@ async def run(http: httpx.Client, v_id: int, file_path: str) -> str:
 
     워커가 status!=OK 를 주면 client 가 이미 예외를 던진다. 여기선 OK 인데 경로가
     비어 오는 경우를 잡는다 — 그대로 두면 STT 가 빈 경로로 돌다 엉뚱한 데서 터진다.
+
+    상태 코드는 여기서 안 찍는다 — 스텝을 부르는 쪽(pipeline)이 찍는다.
     """
     res = await asyncio.to_thread(ffmpeg.prep, http, v_id, file_path)
     if not res.audio_path:
         raise RuntimeError(f"prep 성공인데 audio_path 가 비었다: v_id={v_id} {res}")
+
     log.info(f"ffmpeg v_id={v_id} → {res.audio_path}")
     return res.audio_path

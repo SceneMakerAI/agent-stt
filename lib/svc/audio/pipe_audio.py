@@ -25,6 +25,8 @@ ffmpeg 는 여기 없다 — 이미지 갈래와 공통 선행 작업이라 pipe
 """
 import asyncio
 
+from lib import def_code
+from lib.client.rdb import t_video
 from lib.log import get_logger
 from lib.svc import debug
 from lib.svc.audio.correct import glossary_correct, pipe_correct
@@ -38,6 +40,10 @@ from lib.svc.audio.summary import pipe_summary
 log = get_logger(__name__)
 
 
+async def _mark(v_id: int, code: int) -> None:
+    await asyncio.to_thread(t_video.set_status, v_id, code)
+
+
 async def run(state, req, prof: Audio, audio_path: str) -> AudioOut:
     """음성 갈래 전체. 실패하면 stage 를 로그에 남기고 예외를 그대로 올린다.
 
@@ -46,19 +52,21 @@ async def run(state, req, prof: Audio, audio_path: str) -> AudioOut:
     """
     v_id = req.v_id
     out = AudioOut()
-    stage = "1_search"
+    stage, code = "1_search", def_code.CODE_SEARCH
     search_task = None
 
     try:
         # ① 검색 — 여기서 '띄우기만' 한다. 합류는 whisper 직전(③).
         #    제목이 없으면 검색할 게 없다.
         if prof.search and req.title:
+            await _mark(v_id, code)
             search_task = asyncio.create_task(
                 pipe_search.run(state.vllm, req.title, req.year, req.category))
 
         # ② STT 1차 — 전사 + 정규화·검증(pipe_stt_qwen)
-        stage = "2_stt"
+        stage, code = "2_stt", def_code.CODE_QWEN
         if prof.stt_qwen:
+            await _mark(v_id, code)
             out.dialogue = await pipe_stt_qwen.run(state.http, v_id, audio_path)
         debug.dump(v_id, stage, out.dialogue)
 
@@ -78,7 +86,8 @@ async def run(state, req, prof: Audio, audio_path: str) -> AudioOut:
         # ④ whisper 2차 — 교정 때 대조할 '두 번째 의견'.
         #    명단의 등장인물을 initial_prompt 로 넘겨 이름 정확도를 올린다.
         if prof.stt_whisper:
-            stage = "4_whisper"
+            stage, code = "4_whisper", def_code.CODE_WHISPER
+            await _mark(v_id, code)
             try:
                 out.whisper = await pipe_stt_whisper.run(
                     state.http, v_id, out.dialogue, out.search_result)
@@ -90,17 +99,20 @@ async def run(state, req, prof: Audio, audio_path: str) -> AudioOut:
         # ⑤ 교정 — 1차를 기준으로 whisper 2차·명단·용어집을 참고자료로 대조 교정.
         #    교정은 idx 로 2차를 찾으므로 여기서 조회표로 바꿔 넘긴다.
         stage = "5_correct"
+        code = def_code.CODE_GLOSSARY if prof.correct_glossary else def_code.CODE_CORRECT
         corrected = out.dialogue
         if prof.correct:
+            await _mark(v_id, code)
             corrected = await pipe_correct.run(
                 state.vllm, out.dialogue, out.search_result, req, out.whisper,
                 glossary=glossary_correct.by_category(req.category) if prof.correct_glossary else "")
             debug.dump(v_id, stage, corrected)
 
         # ⑥ 할루시 필터 — 언어이탈 후보 판정 → drop/relang + 재번호
-        stage = "6_hallu"
+        stage, code = "6_hallu", def_code.CODE_HALLU
         out.dialogue_clean = corrected
         if prof.hallu:
+            await _mark(v_id, code)
             out.dialogue_clean = await pipe_hallu.run(state.vllm, corrected)
             debug.dump(v_id, stage, out.dialogue_clean)
             log.info(f"[audio] v_id={v_id} 할루시필터: "
@@ -108,7 +120,8 @@ async def run(state, req, prof: Audio, audio_path: str) -> AudioOut:
 
         # ⑦ 요약 — 구간 + 전체. 깨끗한 대사 입력.
         if prof.summary:
-            stage = "7_summary"
+            stage, code = "7_summary", def_code.CODE_SUMMARY
+            await _mark(v_id, code)
             out.summary = await pipe_summary.run(state.vllm, out.dialogue_clean, req)
             debug.dump(v_id, stage, out.summary)
             log.info(f"[audio] v_id={v_id} 요약: 구간 {len(out.summary.sections)}개")
@@ -116,8 +129,9 @@ async def run(state, req, prof: Audio, audio_path: str) -> AudioOut:
         log.info(f"[audio] v_id={v_id} 완료: {len(out.dialogue_clean.items)} dialogues")
         return out
 
-    except Exception:
-        log.exception(f"[audio] v_id={v_id} 실패 (stage={stage})")
+    except Exception as e:
+        e.status_code = def_code.error_code(code, e)
+        log.exception(f"[audio] v_id={v_id} 실패 (stage={stage}, code={e.status_code})")
         raise
     finally:
         # 앞 스텝이 먼저 터져 합류(await)를 못 했으면 떠 있는 task 정리

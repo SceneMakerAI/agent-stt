@@ -18,7 +18,7 @@ def update_status(cur, vid: int, code: int) -> int:
 
 
 def set_status(vid: int, code: int) -> int:
-    """status_code 갱신을 단독 트랜잭션으로 (핸들러가 바로 호출 — 접수 1001, 처리시작 1005 등).
+    """status_code 갱신을 단독 트랜잭션으로 (공정이 단계마다 호출).
 
     반환: 영향받은 행 수. 0 이면 해당 v_id 가 t_video 에 없다는 뜻.
     """

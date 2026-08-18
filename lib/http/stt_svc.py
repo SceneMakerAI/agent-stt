@@ -1,13 +1,14 @@
 """stt_svc 핸들러 — 1차 공정(prep → STT → 교정 → 저장) 접수. 받는 URL 1개.
 
-여기는 전송 계층 — 상태 '접수'(1001) 갱신과 즉시 응답만 하고, 공정은 svc 에 넘긴다:
+여기는 전송 계층 — 즉시 응답만 하고 공정은 svc 에 넘긴다:
   lib/svc/pipeline.run  (프로파일 해석 → 음성/이미지 병렬 → 저장 → 상태, 카운터 반납까지 책임)
-상태 흐름: 1001(접수) → 1005(처리중) → 1006(완료) / 실패 시 -1.
+접수(2001)만 여기서 찍고, 이후 상태는 pipeline 과 pipe_audio 가 찍는다 (lib/def_code.py).
 """
 from fastapi import APIRouter, BackgroundTasks, Request
 from pydantic import BaseModel
 
 import config
+from lib import def_code
 from lib.client.rdb import t_video
 from lib.http import http_util
 from lib.log import get_logger
@@ -15,9 +16,6 @@ from lib.svc import pipeline
 
 router = APIRouter(prefix="/api/v1", tags=["stt_svc"])
 log = get_logger(__name__)
-
-ACCEPTED = 1001   # t_video.status_code — 접수 시 표시 (이후 상태는 svc/pipeline 이 관리)
-
 
 # ── 요청/응답 메시지 쌍 (POST /stt_svc)
 class SttRequest(BaseModel):
@@ -46,9 +44,9 @@ async def stt_svc(req: SttRequest, bg: BackgroundTasks, request: Request):
         log.warning(f"대기열 초과 ({state.current_req_cnt}/{config.MAX_REQ_CNT}) → 429: v_id={req.v_id}")
         return http_util.busy_response(SttResponse(v_id=req.v_id, status="busy, retry later"))
 
-    # 1-1. 상태 '접수'(1001) 갱신 — 빠른 UPDATE 라 직접 호출. 결과(행 수)로 검증.
-    rows = t_video.set_status(req.v_id, ACCEPTED)
-    if rows != 1:                                  # 1행이어야 정상. 0 → t_video 에 없는 v_id
+    # 접수(2001) 갱신 — 영향 행 수가 v_id 검증을 겸한다. 0 이면 t_video 에 없는 영상이다.
+    rows = t_video.set_status(req.v_id, def_code.CODE_ACCEPT)
+    if rows != 1:
         return SttResponse(v_id=req.v_id, status="Not found v_id")   # 200 + 본문으로 결과 전달
 
     state.current_req_cnt += 1                 # 접수 카운트 — 반납은 pipeline.run 의 finally

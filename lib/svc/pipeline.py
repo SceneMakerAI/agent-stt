@@ -19,6 +19,7 @@
 import asyncio
 
 import config
+from lib import def_code
 from lib.client import vision
 from lib.client.rdb import t_video
 from lib.log import get_logger
@@ -30,7 +31,9 @@ from lib.svc.rdb import save_svc
 
 log = get_logger(__name__)
 
-RUNNING, DONE, FAILED = 1005, 1006, -1     # t_video.status_code
+
+async def _mark(v_id: int, code: int) -> None:
+    await asyncio.to_thread(t_video.set_status, v_id, code)
 
 
 async def run(state, req) -> None:
@@ -41,14 +44,14 @@ async def run(state, req) -> None:
     log.info(f"[pipe] v_id={v_id} category={req.category!r} → "
              f"image={prof.image or '없음'}")
 
+    stage = def_code.CODE_FFMPEG   # 실패 코드 계산용. None 이면 저장 구간
     try:
-        await asyncio.to_thread(t_video.set_status, v_id, RUNNING)
-
         # ① 준비 — 원본에서 음성과 프레임을 뽑는다. 두 갈래의 재료를 모두 여기서 만드므로
         #    **끝날 때까지 기다린 뒤** 갈래를 띄운다. 끄면 요청이 준 file_path 를 그대로
         #    쓴다 (람다 등 바깥에서 이미 준비해 둔 경우 — 프레임도 이미 있다고 본다).
         audio_path = req.file_path
         if prof.ffmpeg:
+            await _mark(v_id, def_code.CODE_FFMPEG)
             audio_path = await pipe_ffmpeg.run(state.http, v_id, req.file_path)
 
         # ② fan-out — 두 갈래는 워커 GPU 가 달라 실제로 병렬로 돈다.
@@ -70,14 +73,20 @@ async def run(state, req) -> None:
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
 
-        for t in done:                           # 하나라도 실패했으면 그대로 올린다
-            if t.exception():
-                raise t.exception()
+        # 하나라도 실패했으면 그대로 올린다. 음성 갈래는 자기가 어느 스텝이었는지 예외에
+        #   붙여 보내므로, 여기서는 이미지 갈래만 코드를 매긴다.
+        for t in done:
+            exc = t.exception()
+            if exc:
+                if t is image_task:
+                    exc.status_code = def_code.error_code(def_code.CODE_ERROR_IMAGE, exc)
+                raise exc
 
         audio_out = audio_task.result()
         image_out = image_task.result() if image_task else None
 
-        await asyncio.to_thread(save_svc.save, v_id, audio_out, image_out, DONE)
+        stage = None
+        await asyncio.to_thread(save_svc.save, v_id, audio_out, image_out, def_code.CODE_OK)
         log.info(f"[pipe] v_id={v_id} 완료")
 
         # 다음 단계 트리거 — .env 의 VISION_TRIGGER 가 on 일 때만 (미연동이면 off).
@@ -87,11 +96,13 @@ async def run(state, req) -> None:
             except Exception:  # noqa: BLE001 — 트리거 실패는 로그만
                 log.exception(f"[pipe] v_id={v_id} vision 트리거 실패 — 결과는 저장됨")
 
-    except Exception:  # noqa: BLE001 — 백그라운드라 응답으로 못 알린다
-        log.exception(f"[pipe] v_id={v_id} 실패")
+    except Exception as e:  # noqa: BLE001 — 백그라운드라 응답으로 못 알린다
+        code = getattr(e, "status_code", None) or (
+            def_code.CODE_ERROR_DB if stage is None else def_code.error_code(stage, e))
+        log.exception(f"[pipe] v_id={v_id} 실패 (code={code})")
         try:
-            await asyncio.to_thread(t_video.set_status, v_id, FAILED)
+            await _mark(v_id, code)
         except Exception:  # noqa: BLE001 — DB 장애 자체가 원인일 수 있다
-            log.exception(f"[pipe] v_id={v_id} 실패 상태(-1) 기록도 실패")
+            log.exception(f"[pipe] v_id={v_id} 실패 상태({code}) 기록도 실패")
     finally:
         state.current_req_cnt -= 1               # 성공·실패 무관 접수 슬롯 반납
